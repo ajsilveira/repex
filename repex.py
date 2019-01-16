@@ -4,17 +4,20 @@ import time
 import pathlib
 import logging
 import argparse
-import parmed as pmd
 
 import mdtraj as md
 import numpy as np
+import yank
 
 from simtk import openmm, unit
 from simtk.openmm import app
 from mdtraj.reporters import NetCDFReporter
-import yank
+
 from simtk.openmm import XmlSerializer
 from openmmtools import states, mcmc
+from openmmtools import states.GlobalParameterState
+from yank.multistate import ReplicaExchangeSampler, MultiStateReporter
+
 
 class MyComposableState(GlobalParameterState):
     lambda_restraints = GlobalParameterState.GlobalParameter('lambda_restraints', standard_value=0.0)
@@ -25,14 +28,13 @@ class MyComposableState(GlobalParameterState):
     Kmin = GlobalParameterState.GlobalParameter('Kmin',
                                                 standard_value=500*unit.kilojoules_per_mole/unit.nanometer**2)
 
-def write_cv(context):
-
-    for replica_index in range(simulation.n_replicas):
-        state_index = simulation._replica_thermodynamic_states[replica_index]
-        ss = simulation.sampler_states[replica_index]
-        ss.apply_to_context(context, ignore_velocities=True)
-        ss.update_from_context(context, ignore_positions=True, ignore_velocities=True)
-        logger.debug(ss.collective_variables)
+# def write_cv(replica_index, context, simulation):
+#
+#         state_index = simulation._replica_thermodynamic_states[replica_index]
+#         ss = simulation.sampler_states[replica_index]
+#         ss.apply_to_context(context, ignore_velocities=True)
+#         ss.update_from_context(context, ignore_velocities=True)
+#         print("{} {} {}".format(state_index , *ss.collective_variables),file=file)
 
 def main():
     parser = argparse.ArgumentParser(description='Compute a potential of mean force (PMF) for porin permeation.')
@@ -46,8 +48,17 @@ def main():
     logging.root.setLevel(logging.DEBUG)
     logging.basicConfig(level=logging.DEBUG)
     yank.utils.config_root_logger(verbose=True, log_file_path=None)
-    platform = openmm.Platform.getPlatformByName('CUDA')
-    integrator = openmm.LangevinIntegrator(310*unit.kelvin, 1.0/unit.picoseconds, 2*unit.femtosecond)
+
+    # Configure ContextCache, platform and precision
+    from yank.experiment import ExperimentBuilder
+    platform = ExperimentBuilder._configure_platform(platform_name, precision)
+
+    try:
+        openmmtools.cache.global_context_cache.platform = platform
+    except RuntimeError:
+        # The cache has been already used. Empty it before switching platform.
+        openmmtools.cache.global_context_cache.empty()
+        openmmtools.cache.global_context_cache.platform = platform
 
     # Topology
     pdbx = app.PDBxFile('mem_prot_md_system.pdbx')
@@ -69,20 +80,23 @@ def main():
     positions = t.openmm_positions(configs[index])
 
     thermodynamic_state_deserialized = states.ThermodynamicState(system=openmm_system,
-                                                                temperature=310*unit.kelvin,
-                                                                pressure=1.0 * unit.atmospheres)
+                                                                 temperature=310*unit.kelvin,
+                                                                 pressure=1.0*unit.atmospheres)
 
     sampler_state = states.SamplerState(positions=positions, box_vectors=t.unitcell_vectors[configs[index],:,:])
 
-    move = mcmc.LangevinDynamicsMove(timestep=2*unit.femtosecond, collision_rate= 1.0/unit.picoseconds, n_steps=2000, reassign_velocities=False)
+    move = mcmc.LangevinDynamicsMove(timestep=2*unit.femtosecond,
+                                    collision_rate= 1.0/unit.picoseconds,
+                                    n_steps=2000,
+                                    reassign_velocities=False)
     simulation = ReplicaExchangeSampler(mcmc_moves=move, number_of_iterations=1)
     analysis_particle_indices = topology.select('(protein and mass > 3.0) or (resname MER and mass > 3.0)')
-    reporter = MultiStateReporter(checkpoint_interval=checkpoint_interval, analysis_particle_indices=analysis_particle_indices)
+    reporter = MultiStateReporter(checkpoint_interval=2000, analysis_particle_indices=analysis_particle_indices)
 
 
     # Initialize compound thermodynamic states
     protocol = {'lambda_restraints': [ i/159 for i in range(first, last+1)],
-                'K_parallel': [500*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)],
+                'K_parallel': [1250*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)],
                 'Kmax': [500*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)],
                 'Kmin': [500*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)]}
 
@@ -100,17 +114,30 @@ def main():
     simulation.run()
     ts = simulation._thermodynamic_states[0]
     context, _ = openmmtools.cache.global_context_cache.get_context(ts)
-    i/159 for i in range(first, last+1)
-    files_names = ['state_' + i + '.log' for i in range(simulation.n_replicas)]
+
+    files_names = ['state_{}_{}.log'.format(index, i) for i in range(simulation.n_replicas)]
     files = []
     for i, file in enumerate(files_names):
         files.append(open(file, 'w'))
 
-    mpi.distribute(write_cv(context), range(simulation.n_replicas), send_results_to=None)
+    for replica_index in range(simulation.n_replicas):
+        state_index = simulation._replica_thermodynamic_states[replica_index]
+        ss = simulation.sampler_states[replica_index]
+        ss.apply_to_context(context, ignore_velocities=True)
+        ss.update_from_context(context, ignore_velocities=True)
+        print("{} {} {}".format(state_index , *ss.collective_variables),file=files[replica_index])
 
-    for i in range(10000):
-       simulation.extend(n_iterations=1)
-       mpi.distribute(write_cv(context), range(simulation.n_replicas), send_results_to=None)
+    #mpi.distribute(write_cv, range(simulation.n_replicas), context, simulation,  send_results_to=None)
+
+    for i in range(10):
+       simulation.extend(n_iterations=2)
+       for replica_index in range(simulation.n_replicas):
+           state_index = simulation._replica_thermodynamic_states[replica_index]
+           ss = simulation.sampler_states[replica_index]
+           ss.apply_to_context(context, ignore_velocities=True)
+           ss.update_from_context(context, ignore_velocities=True)
+           print("{} {} {}".format(state_index , *ss.collective_variables),file=files[replica_index])
+       #mpi.distribute(write_cv, range(simulation.n_replicas), context, simulation, send_results_to=None)
 
 if __name__ == "__main__":
     # Do something if this file is invoked on its own
