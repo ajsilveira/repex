@@ -13,20 +13,21 @@ from simtk import openmm, unit
 from simtk.openmm import app
 from mdtraj.reporters import NetCDFReporter
 
+import openmmtools
 from simtk.openmm import XmlSerializer
 from openmmtools import states, mcmc
-from openmmtools import states.GlobalParameterState
+from openmmtools.states import GlobalParameterState
 from yank.multistate import ReplicaExchangeSampler, MultiStateReporter
 
 
 class MyComposableState(GlobalParameterState):
-    lambda_restraints = GlobalParameterState.GlobalParameter('lambda_restraints', standard_value=0.0)
+    lambda_restraints = GlobalParameterState.GlobalParameter('lambda_restraints', standard_value=1.0)
     K_parallel = GlobalParameterState.GlobalParameter('K_parallel',
-                                                    standard_value=1250*unit.kilojoules_per_mole/unit.nanometer**2)
+                                                    standard_value=1000*unit.kilojoules_per_mole/unit.nanometer**2)
     Kmax = GlobalParameterState.GlobalParameter('Kmax',
-                                                standard_value=500*unit.kilojoules_per_mole/unit.nanometer**2)
+                                                standard_value=1000*unit.kilojoules_per_mole/unit.nanometer**2)
     Kmin = GlobalParameterState.GlobalParameter('Kmin',
-                                                standard_value=500*unit.kilojoules_per_mole/unit.nanometer**2)
+                                                standard_value=10*unit.kilojoules_per_mole/unit.nanometer**2)
 
 # def write_cv(replica_index, context, simulation):
 #
@@ -51,7 +52,7 @@ def main():
 
     # Configure ContextCache, platform and precision
     from yank.experiment import ExperimentBuilder
-    platform = ExperimentBuilder._configure_platform(platform_name, precision)
+    platform = ExperimentBuilder._configure_platform('CUDA', 'mixed')
 
     try:
         openmmtools.cache.global_context_cache.platform = platform
@@ -91,9 +92,9 @@ def main():
                                     reassign_velocities=False)
     simulation = ReplicaExchangeSampler(mcmc_moves=move, number_of_iterations=1)
     analysis_particle_indices = topology.select('(protein and mass > 3.0) or (resname MER and mass > 3.0)')
-    reporter = MultiStateReporter(checkpoint_interval=2000, analysis_particle_indices=analysis_particle_indices)
+    reporter = MultiStateReporter('output_' + str(index) + '.nc',checkpoint_interval=2000, analysis_particle_indices=analysis_particle_indices)
 
-
+    first, last = limits[index]	
     # Initialize compound thermodynamic states
     protocol = {'lambda_restraints': [ i/159 for i in range(first, last+1)],
                 'K_parallel': [1250*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)],
