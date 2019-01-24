@@ -18,7 +18,7 @@ from simtk.openmm import XmlSerializer
 from openmmtools import states, mcmc
 from openmmtools.states import GlobalParameterState
 from yank.multistate import ReplicaExchangeSampler, MultiStateReporter
-
+from yank import mpi
 
 class MyComposableState(GlobalParameterState):
      lambda_restraints = GlobalParameterState.GlobalParameter('lambda_restraints', standard_value=1.0)
@@ -35,7 +35,7 @@ def write_cv(replica_index, context, simulation, files):
         ss = simulation.sampler_states[replica_index]
         ss.apply_to_context(context, ignore_velocities=True)
         ss.update_from_context(context, ignore_positions=True, ignore_velocities=True)
-        print("{} {}".format(*ss.collective_variables),file=files[state_index])
+        print(ss.collective_variables,file=files[state_index])
 
 
 def main():
@@ -88,11 +88,12 @@ def main():
                                                                  temperature=310*unit.kelvin,
                                                                  pressure=1.0*unit.atmospheres)
 
-    sampler_state = states.SamplerState(positions=positions, box_vectors=t.unitcell_vectors[configs[index],:,:])
 
+    sampler_state = states.SamplerState(positions=positions, box_vectors=t.unitcell_vectors[configs[index],:,:]*unit.nanometer)
+    logger.debug(type(sampler_state))
     move = mcmc.LangevinDynamicsMove(timestep=2*unit.femtosecond,
                                     collision_rate= 1.0/unit.picoseconds,
-                                    n_steps=2000,
+                                    n_steps=500,
                                     reassign_velocities=False)
     simulation = ReplicaExchangeSampler(mcmc_moves=move, number_of_iterations=1)
     analysis_particle_indices = topology.select('(protein and mass > 3.0) or (resname MER and mass > 3.0)')
@@ -105,18 +106,19 @@ def main():
                 'Kmax': [500*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)],
                 'Kmin': [500*unit.kilojoules_per_mole/unit.nanometer**2 for i in range(first, last+1)]}
 
+
     my_composable_state = MyComposableState.from_system(openmm_system)
-    logger.debug(my_composable_state.lambda_restraints)
+
     compound_states = states.create_thermodynamic_state_protocol(thermodynamic_state_deserialized,
                                                                 protocol=protocol,
                                                                 composable_states=[my_composable_state])
 
     simulation.create(thermodynamic_states=compound_states,
-                      sampler_states=sampler_state,
+                      sampler_states=[sampler_state],
                       storage=reporter)
 
-    simulation.equilibrate(100000, mcmc_moves=move)
 
+    simulation.equilibrate(50, mcmc_moves=move)
     simulation.run()
     ts = simulation._thermodynamic_states[0]
     context, _ = openmmtools.cache.global_context_cache.get_context(ts)
@@ -128,7 +130,7 @@ def main():
 
     mpi.distribute(write_cv, range(simulation.n_replicas), context, simulation, files, send_results_to=None)
 
-    for i in range(10):
+    for i in range(10000):
        simulation.extend(n_iterations=2)
        mpi.distribute(write_cv, range(simulation.n_replicas), context, simulation, files, send_results_to=None)
 
